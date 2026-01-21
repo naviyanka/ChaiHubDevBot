@@ -11,10 +11,9 @@ from .models import ApprovalRequest, ApprovalStatus
 class ApprovalStore:
     def __init__(self, timeout_seconds: int) -> None:
         self._requests: Dict[str, ApprovalRequest] = {}
-        self._futures: Dict[str, asyncio.Future[ApprovalStatus]] = {}
+        self._events: Dict[str, asyncio.Event] = {}
         self._timeout_seconds = timeout_seconds
         self._notifier: Optional[Callable[[ApprovalRequest], None]] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def set_notifier(self, notifier: Callable[[ApprovalRequest], None]) -> None:
         self._notifier = notifier
@@ -26,8 +25,6 @@ class ApprovalStore:
         return self._requests.get(request_id)
 
     def create_request(self, action_summary: str, risk: str) -> ApprovalRequest:
-        if self._loop is None:
-            self._loop = asyncio.get_running_loop()
         request_id = str(uuid4())
         request = ApprovalRequest(
             request_id=request_id,
@@ -36,15 +33,16 @@ class ApprovalStore:
             status=ApprovalStatus.WAITING,
         )
         self._requests[request_id] = request
-        self._futures[request_id] = self._loop.create_future()
+        self._events[request_id] = asyncio.Event()
         if self._notifier:
             self._notifier(request)
-        self._loop.create_task(self._handle_timeout(request_id))
+        asyncio.create_task(self._handle_timeout(request_id))
         return request
 
     async def wait_for_decision(self, request_id: str) -> ApprovalStatus:
-        future = self._futures[request_id]
-        return await future
+        event = self._events[request_id]
+        await event.wait()
+        return self._requests[request_id].status
 
     def decide(self, request_id: str, approved: bool) -> ApprovalStatus:
         request = self._requests.get(request_id)
@@ -54,7 +52,7 @@ class ApprovalStore:
             return request.status
         request.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.DENIED
         request.decision_at = datetime.utcnow()
-        self._resolve_future(request_id, request.status)
+        self._events[request_id].set()
         return request.status
 
     async def _handle_timeout(self, request_id: str) -> None:
@@ -64,13 +62,4 @@ class ApprovalStore:
             return
         request.status = ApprovalStatus.TIMED_OUT
         request.decision_at = datetime.utcnow()
-        self._resolve_future(request_id, request.status)
-
-    def _resolve_future(self, request_id: str, status: ApprovalStatus) -> None:
-        future = self._futures.get(request_id)
-        if not future or future.done():
-            return
-        if self._loop is None:
-            future.set_result(status)
-            return
-        self._loop.call_soon_threadsafe(future.set_result, status)
+        self._events[request_id].set()
